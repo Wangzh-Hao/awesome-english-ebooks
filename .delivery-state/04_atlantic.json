@@ -1,5 +1,7 @@
 {
-  "sent": [],
+  "sent": [
+    "f24df46e0590e98fbb7667046d647dd1bb9af7f5"
+  ],
   "parts": [
     "f24df46e0590e98fbb7667046d647dd1bb9af7f5/split-v1/30e2ca3029ae72e3acf6f3d84faca3efd81f78af32392a093b7cbad27d6a1a92",
     "f24df46e0590e98fbb7667046d647dd1bb9af7f5/split-v1/510d9157a49470dfbb4f0bcba1ee19029567874c5930e24032c32a921003dd79",
@@ -7,5 +9,5 @@
   ],
   "latest_path": "04_atlantic/2026.09.02/Atlantic_2026.09.02.epub",
   "latest_issue": "2026-09-02",
-  "sent_at": "2026-10-17T07:34:26.322138+00:00"
+  "sent_at": "2026-10-17T07:34:27.889876+00:00"
 }
