@@ -2,14 +2,33 @@ name: Send latest magazines to Kindle
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only download/check EPUBs; do not send email"
+        type: boolean
+        default: true
+      force:
+        description: "Send again even if this issue was already sent"
+        type: boolean
+        default: false
   schedule:
+    # UTC, unchanged from the original workflow.
     - cron: "0 15 * * 5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: magazine-kindle-delivery
+  cancel-in-progress: false
 
 jobs:
   send:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
+      max-parallel: 1
       matrix:
         magazine:
           - name: Economist
@@ -20,28 +39,196 @@ jobs:
             path: 04_atlantic
           - name: Wired
             path: 05_wired
+    env:
+      MAGAZINE_NAME: ${{ matrix.magazine.name }}
+      MAGAZINE_PATH: ${{ matrix.magazine.path }}
+      STATE_BRANCH: ${{ github.event.repository.default_branch }}
+      FORCE_SEND: ${{ inputs.force || false }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
 
     steps:
-      - name: Find latest EPUB
+      - name: Install EPUB image optimizer
+        run: python -m pip install --disable-pip-version-check 'Pillow==12.3.0'
+
+      - name: Select, download and optimize latest EPUB
         id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
         run: |
-          git clone --depth=1 \
-            https://github.com/hehonghui/awesome-english-ebooks.git upstream
+          import base64
+          import copy
+          import datetime as dt
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          import zipfile
+          from pathlib import Path
+          from PIL import Image
 
-          file=$(find "upstream/${{ matrix.magazine.path }}" \
-            -type f -iname "*.epub" \
-            -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)
+          UPSTREAM = "hehonghui/awesome-english-ebooks"
+          # Leave room for base64/MIME overhead below Gmail's message limit.
+          MAX_BYTES = 17_000_000
 
-          if [ -z "$file" ]; then
-            echo "没有找到 EPUB：${{ matrix.magazine.name }}"
-            exit 1
-          fi
+          def api(path):
+              request = urllib.request.Request(
+                  "https://api.github.com/" + path,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "magazine-kindle-delivery"})
+              for attempt in range(4):
+                  try:
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          return json.load(response)
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                          raise
+                      time.sleep(2 ** attempt)
 
-          echo "file=$file" >> "$GITHUB_OUTPUT"
-          echo "找到：$file"
+          def summary(message):
+              print(message, flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                  f.write(message + "\n\n")
+
+          def issue_date(path):
+              dates = []
+              for year, month, day in re.findall(
+                      r"(?<!\d)(20\d{2})[._-](\d{2})[._-](\d{2})(?!\d)", path):
+                  try:
+                      dates.append(dt.date(int(year), int(month), int(day)))
+                  except ValueError:
+                      pass
+              return max(dates) if dates else dt.date.min
+
+          def validate_epub(path):
+              with zipfile.ZipFile(path) as book:
+                  if book.testzip() is not None:
+                      raise RuntimeError("EPUB contains a damaged ZIP entry")
+                  if book.read("mimetype").strip() != b"application/epub+zip":
+                      raise RuntimeError("Downloaded file is not an EPUB")
+                  container = ET.fromstring(book.read("META-INF/container.xml"))
+                  packages = container.findall(".//{*}rootfile")
+                  if not packages:
+                      raise RuntimeError("EPUB has no package document")
+                  for package in packages:
+                      ET.fromstring(book.read(package.attrib["full-path"]))
+
+          def optimize(source, target, edge, quality, colors):
+              with zipfile.ZipFile(source) as book, zipfile.ZipFile(
+                      target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out:
+                  out.writestr("mimetype", b"application/epub+zip",
+                               compress_type=zipfile.ZIP_STORED)
+                  for entry in book.infolist():
+                      if entry.filename == "mimetype":
+                          continue
+                      data = book.read(entry)
+                      if Path(entry.filename).suffix.lower() in (".jpg", ".jpeg", ".png"):
+                          with Image.open(io.BytesIO(data)) as image:
+                              image.load()
+                              fmt = image.format
+                              image.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+                              buffer = io.BytesIO()
+                              if fmt == "JPEG":
+                                  image.convert("RGB").save(buffer, "JPEG", quality=quality,
+                                                            optimize=True)
+                              elif fmt == "PNG":
+                                  image.convert("RGBA").quantize(colors=colors).save(
+                                      buffer, "PNG", optimize=True)
+                              if 0 < buffer.tell() < len(data):
+                                  data = buffer.getvalue()
+                      info = copy.copy(entry)
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      out.writestr(info, data)
+
+          def main():
+              directory = os.environ["MAGAZINE_PATH"]
+              name = os.environ["MAGAZINE_NAME"]
+              repo = os.environ["GITHUB_REPOSITORY"]
+              state_path = ".delivery-state/" + directory + ".json"
+              ref = urllib.parse.quote(os.environ["STATE_BRANCH"], safe="")
+              try:
+                  saved = api(f"repos/{repo}/contents/{state_path}?ref={ref}")
+                  state = json.loads(base64.b64decode(saved["content"]))
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+                  state = {"sent": []}
+
+              tree = api(f"repos/{UPSTREAM}/git/trees/master?recursive=1")
+              if tree.get("truncated"):
+                  raise RuntimeError("Upstream file listing is truncated; refusing to guess")
+              candidates = [entry for entry in tree["tree"]
+                            if entry["type"] == "blob"
+                            and entry["path"].startswith(directory + "/")
+                            and entry["path"].lower().endswith(".epub")
+                            and issue_date(entry["path"]) != dt.date.min]
+              if not candidates:
+                  raise RuntimeError("No dated EPUB found for " + name)
+              latest = max(candidates, key=lambda entry: (issue_date(entry["path"]), entry["path"]))
+              issue = issue_date(latest["path"]).isoformat()
+              summary(f"### {name} — {issue}\nSelected: `{latest['path']}`")
+              if latest["sha"] in state["sent"] and os.environ["FORCE_SEND"] != "true":
+                  summary("Already sent successfully; skipped.")
+                  return
+
+              Path("delivery").mkdir(exist_ok=True)
+              original = Path("delivery") / Path(latest["path"]).name
+              url = (f"https://raw.githubusercontent.com/{UPSTREAM}/{tree['sha']}/"
+                     + urllib.parse.quote(latest["path"], safe="/"))
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=120) as response:
+                          data = response.read()
+                      break
+                  except (OSError, TimeoutError):
+                      if attempt == 2:
+                          raise
+                      time.sleep(2 ** attempt)
+              digest = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+              if digest != latest["sha"]:
+                  raise RuntimeError("Downloaded file does not match the selected upstream blob")
+              original.write_bytes(data)
+              del data
+              validate_epub(original)
+              attachment = original
+              summary(f"Original size: {original.stat().st_size / 1048576:.2f} MiB")
+              if original.stat().st_size > MAX_BYTES:
+                  for edge, quality, colors in [(1600, 80, 128), (1200, 65, 96), (900, 50, 64)]:
+                      candidate = original.with_name(original.stem + f"-optimized-{edge}.epub")
+                      optimize(original, candidate, edge, quality, colors)
+                      summary(f"Image optimization ({edge}px): {candidate.stat().st_size / 1048576:.2f} MiB")
+                      if candidate.stat().st_size < attachment.stat().st_size:
+                          attachment = candidate
+                      if attachment.stat().st_size <= MAX_BYTES:
+                          break
+              validate_epub(attachment)
+              if attachment.stat().st_size > MAX_BYTES:
+                  raise RuntimeError("EPUB still exceeds the safe email limit after image optimization; "
+                                     "no email sent and issue not marked as delivered")
+              if latest["sha"] not in state["sent"]:
+                  state["sent"].append(latest["sha"])
+              state.update({"latest_path": latest["path"], "latest_issue": issue,
+                            "sent_at": dt.datetime.now(dt.timezone.utc).isoformat()})
+              Path("delivery/next-state.json").write_text(json.dumps(state, indent=2) + "\n")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"file={attachment.as_posix()}\nissue={issue}\nready=true\n")
+              if os.environ["DRY_RUN"] == "true":
+                  summary("Dry run passed. No email sent and no delivery record saved.")
+              else:
+                  summary("EPUB passed validation and size checks; ready to email.")
+
+          main()
 
       - name: Send to Kindle
-        uses: dawidd6/action-send-mail@v6
+        if: steps.latest.outputs.ready == 'true' && env.DRY_RUN != 'true'
+        uses: dawidd6/action-send-mail@6d98ae34d733f9a723a9e04e94f2f24ba05e1402 # v6
         with:
           server_address: smtp.gmail.com
           server_port: 465
@@ -50,6 +237,54 @@ jobs:
           password: ${{ secrets.SMTP_PASSWORD }}
           from: ${{ secrets.SMTP_USERNAME }}
           to: ${{ secrets.KINDLE_EMAIL }}
-          subject: "[Kindle] ${{ matrix.magazine.name }}"
-          body: "Latest EPUB: ${{ matrix.magazine.name }}"
+          subject: "[Kindle] ${{ matrix.magazine.name }} ${{ steps.latest.outputs.issue }}"
+          body: "Latest EPUB: ${{ matrix.magazine.name }} ${{ steps.latest.outputs.issue }}"
           attachments: ${{ steps.latest.outputs.file }}
+
+      - name: Save successful delivery record
+        if: steps.latest.outputs.ready == 'true' && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          path = ".delivery-state/" + os.environ["MAGAZINE_PATH"] + ".json"
+          url = f"https://api.github.com/repos/{repo}/contents/{path}"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "magazine-kindle-delivery"}
+          payload = {"message": "Record magazine delivery [skip ci]",
+                     "branch": os.environ["STATE_BRANCH"],
+                     "content": base64.b64encode(Path("delivery/next-state.json").read_bytes()).decode()}
+          for attempt in range(4):
+              try:
+                  ref = urllib.parse.quote(os.environ["STATE_BRANCH"], safe="")
+                  try:
+                      request = urllib.request.Request(url + "?ref=" + ref, headers=headers)
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          payload["sha"] = json.load(response)["sha"]
+                  except urllib.error.HTTPError as error:
+                      if error.code != 404:
+                          raise
+                      payload.pop("sha", None)
+                  request = urllib.request.Request(url, headers=headers, method="PUT",
+                                                   data=json.dumps(payload).encode())
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      json.load(response)
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code not in (409, 429, 500, 502, 503, 504) or attempt == 3:
+                      raise RuntimeError("Email was sent, but saving its delivery record failed; "
+                                         "check the recipient before retrying") from error
+                  time.sleep(2 ** attempt)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("Email accepted by SMTP; delivery record saved. Kindle receipt still needs confirmation.\n")
