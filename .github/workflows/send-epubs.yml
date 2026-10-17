@@ -3,6 +3,13 @@ name: Send latest magazines to Kindle
 on:
   workflow_dispatch:
     inputs:
+      magazines:
+        description: "Magazines to deliver"
+        type: choice
+        default: all
+        options:
+          - all
+          - Wired and Atlantic
       dry_run:
         description: "Only download/check EPUBs; do not send email"
         type: boolean
@@ -30,15 +37,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        magazine:
-          - name: Economist
-            path: 01_economist
-          - name: New Yorker
-            path: 02_new_yorker
-          - name: Atlantic
-            path: 04_atlantic
-          - name: Wired
-            path: 05_wired
+        magazine: ${{ fromJSON(inputs.magazines == 'Wired and Atlantic' && '[{"name":"Atlantic","path":"04_atlantic"},{"name":"Wired","path":"05_wired"}]' || '[{"name":"Economist","path":"01_economist"},{"name":"New Yorker","path":"02_new_yorker"},{"name":"Atlantic","path":"04_atlantic"},{"name":"Wired","path":"05_wired"}]') }}
     env:
       MAGAZINE_NAME: ${{ matrix.magazine.name }}
       MAGAZINE_PATH: ${{ matrix.magazine.path }}
