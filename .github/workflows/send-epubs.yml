@@ -47,10 +47,10 @@ jobs:
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
 
     steps:
-      - name: Install EPUB image optimizer
-        run: python -m pip install --disable-pip-version-check 'Pillow==12.3.0'
+      - name: Install EPUB splitter dependencies
+        run: python -m pip install --disable-pip-version-check 'beautifulsoup4==4.13.4' 'html5lib==1.1' 'six==1.17.0'
 
-      - name: Select, download and optimize latest EPUB
+      - name: Select, download and split latest EPUB without image compression
         id: latest
         env:
           GH_TOKEN: ${{ github.token }}
@@ -60,6 +60,7 @@ jobs:
           import copy
           import datetime as dt
           import hashlib
+          import importlib.util
           import io
           import json
           import os
@@ -69,9 +70,12 @@ jobs:
           import urllib.parse
           import urllib.request
           import xml.etree.ElementTree as ET
+          from xml.dom.minidom import parseString
           import zipfile
+          import uuid
+          from collections import OrderedDict
+          from posixpath import dirname, join, normpath
           from pathlib import Path
-          from PIL import Image
 
           UPSTREAM = "hehonghui/awesome-english-ebooks"
           # Leave room for base64/MIME overhead below Gmail's message limit.
@@ -118,34 +122,249 @@ jobs:
                   if not packages:
                       raise RuntimeError("EPUB has no package document")
                   for package in packages:
-                      ET.fromstring(book.read(package.attrib["full-path"]))
+                      opf_path = package.attrib["full-path"]
+                      opf = ET.fromstring(book.read(opf_path))
+                      items = {item.attrib["id"]: item for item in opf.findall(".//{*}manifest/{*}item")}
+                      for item in items.values():
+                          href = urllib.parse.unquote(urllib.parse.urlsplit(item.attrib["href"]).path)
+                          book.getinfo(normpath(join(dirname(opf_path), href)))
+                      for item in opf.findall(".//{*}spine/{*}itemref"):
+                          if item.attrib["idref"] not in items:
+                              raise RuntimeError("EPUB spine references a missing manifest item")
 
-          def optimize(source, target, edge, quality, colors):
-              with zipfile.ZipFile(source) as book, zipfile.ZipFile(
-                      target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as out:
-                  out.writestr("mimetype", b"application/epub+zip",
-                               compress_type=zipfile.ZIP_STORED)
-                  for entry in book.infolist():
-                      if entry.filename == "mimetype":
-                          continue
-                      data = book.read(entry)
-                      if Path(entry.filename).suffix.lower() in (".jpg", ".jpeg", ".png"):
-                          with Image.open(io.BytesIO(data)) as image:
-                              image.load()
-                              fmt = image.format
-                              image.thumbnail((edge, edge), Image.Resampling.LANCZOS)
-                              buffer = io.BytesIO()
-                              if fmt == "JPEG":
-                                  image.convert("RGB").save(buffer, "JPEG", quality=quality,
-                                                            optimize=True)
-                              elif fmt == "PNG":
-                                  image.convert("RGBA").quantize(colors=colors).save(
-                                      buffer, "PNG", optimize=True)
-                              if 0 < buffer.tell() < len(data):
-                                  data = buffer.getvalue()
-                      info = copy.copy(entry)
-                      info.compress_type = zipfile.ZIP_DEFLATED
-                      out.writestr(info, data)
+          def load_splitter():
+              # Fixed upstream revision of the Calibre EpubSplit standalone library.
+              revision = "a0b31ea9c0c9b439329574c4752b24eaaab67f72"
+              url = f"https://raw.githubusercontent.com/JimmXinu/EpubSplit/{revision}/epubsplit.py"
+              module_path = Path("delivery/epubsplit.py")
+              with urllib.request.urlopen(url, timeout=60) as response:
+                  module_path.write_bytes(response.read())
+              spec = importlib.util.spec_from_file_location("epubsplit", module_path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module.SplitEpub
+
+          def set_unique_id(path, identity):
+              # EpubSplit's default ID is based on seconds; volumes need distinct IDs.
+              with zipfile.ZipFile(path) as book:
+                  entries = [(entry, book.read(entry)) for entry in book.infolist()]
+              with zipfile.ZipFile(path, "w") as out:
+                  for entry, data in entries:
+                      if entry.filename == "content.opf":
+                          root = ET.fromstring(data)
+                          for node in root.findall(".//{*}identifier"):
+                              node.text = identity
+                          data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                      elif entry.filename == "toc.ncx":
+                          root = ET.fromstring(data)
+                          for node in root.findall(".//{*}meta"):
+                              if node.get("name") == "dtb:uid":
+                                  node.set("content", identity)
+                          data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                      out.writestr(entry, data)
+
+          def subdivide_article(source, target, href):
+              # Split one oversized XHTML article between whole paragraphs/figures.
+              # Wrapper elements/styles remain; no text or image is downsampled.
+              with zipfile.ZipFile(source) as book:
+                  root = ET.fromstring(book.read(href))
+                  body = root.find(".//{*}body")
+                  if body is None or body not in list(root):
+                      raise RuntimeError("Cannot safely find this article's body")
+                  blocks = {"p", "div", "figure", "blockquote", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+                  def weight(node):
+                      size = len(node.text or "")
+                      src = node.get("src") or node.get("{http://www.w3.org/1999/xlink}href")
+                      if src and node.tag.rsplit("}", 1)[-1] in ("img", "image"):
+                          resource = normpath(join(dirname(href), urllib.parse.unquote(src)))
+                          if resource in book.namelist():
+                              size += book.getinfo(resource).compress_size
+                      return size
+                  total = sum(weight(node) for node in body.iter())
+                  prefix, choices = 0, []
+                  for node in body.iter():
+                      if (node is not body and node.tag.rsplit("}", 1)[-1] in blocks
+                              and 0 < prefix < total):
+                          choices.append((abs(total - 2 * prefix), len(choices), node))
+                      prefix += weight(node)
+                  if not choices:
+                      raise RuntimeError("Single oversized image/block cannot be split losslessly for email")
+                  boundary = min(choices, key=lambda item: item[:2])[2]
+
+                  def bisect(node):
+                      if node is boundary:
+                          return None, copy.deepcopy(node)
+                      left, right = ET.Element(node.tag, node.attrib), ET.Element(node.tag, node.attrib)
+                      left.text, right.tail = node.text, node.tail
+                      found = False
+                      for child in node:
+                          if boundary in child.iter():
+                              before, after = bisect(child)
+                              if before is not None:
+                                  left.append(before)
+                              right.append(after)
+                              found = True
+                          elif found:
+                              right.append(copy.deepcopy(child))
+                          else:
+                              left.append(copy.deepcopy(child))
+                      return left, right
+
+                  bodies = bisect(body)
+                  def text(element):
+                      return re.sub(r"\s+", "", "".join(element.itertext()))
+                  def images(element):
+                      return [(node.tag, sorted(node.attrib.items())) for node in element.iter()
+                              if node.tag.rsplit("}", 1)[-1] in ("img", "image")]
+                  if text(body) != "".join(text(part) for part in bodies):
+                      raise RuntimeError("Article subdivision lost text")
+                  if images(body) != [image for part in bodies for image in images(part)]:
+                      raise RuntimeError("Article subdivision lost or reordered images")
+                  ET.register_namespace("", "http://www.w3.org/1999/xhtml")
+                  documents = []
+                  for part in bodies:
+                      document = copy.deepcopy(root)
+                      old_body = document.find(".//{*}body")
+                      position = list(document).index(old_body)
+                      document.remove(old_body)
+                      document.insert(position, part)
+                      documents.append(ET.tostring(document, encoding="utf-8", xml_declaration=True))
+                  second_href = str(Path(href).with_name(Path(href).stem + "-continued" + Path(href).suffix)).replace("\\", "/")
+                  if second_href in book.namelist():
+                      raise RuntimeError("Article continuation filename collision")
+                  container = ET.fromstring(book.read("META-INF/container.xml"))
+                  opf_path = container.find(".//{*}rootfile").get("full-path")
+                  dom = parseString(book.read(opf_path))
+                  item = next(item for item in dom.getElementsByTagName("item")
+                              if normpath(join(dirname(opf_path), urllib.parse.unquote(item.getAttribute("href")))) == href)
+                  first_id = item.getAttribute("id")
+                  next_id = first_id + "_continued"
+                  if any(node.getAttribute("id") == next_id for node in dom.getElementsByTagName("item")):
+                      raise RuntimeError("Article continuation manifest ID collision")
+                  new_item = item.cloneNode(deep=True)
+                  new_item.setAttribute("id", next_id)
+                  relative = os.path.relpath(second_href, dirname(opf_path) or ".").replace("\\", "/")
+                  new_item.setAttribute("href", relative)
+                  item.parentNode.appendChild(new_item)
+                  reference = next(node for node in dom.getElementsByTagName("itemref")
+                                   if node.getAttribute("idref") == first_id)
+                  next_reference = reference.cloneNode(deep=True)
+                  next_reference.setAttribute("idref", next_id)
+                  reference.parentNode.insertBefore(next_reference, reference.nextSibling)
+                  with zipfile.ZipFile(target, "w") as out:
+                      for entry in book.infolist():
+                          data = book.read(entry)
+                          if entry.filename == href:
+                              data = documents[0]
+                          elif entry.filename == opf_path:
+                              data = dom.toxml(encoding="utf-8")
+                          out.writestr(entry, data)
+                      out.writestr(second_href, documents[1], compress_type=zipfile.ZIP_DEFLATED)
+              validate_epub(target)
+              summary("Oversized article divided at a paragraph/figure boundary: " + href)
+
+          def split_epub(source, source_sha, title, depth=0):
+              if depth > 20:
+                  raise RuntimeError("Cannot split this EPUB further without changing its content")
+              SplitEpub = load_splitter()
+              splitter = SplitEpub(str(source))
+              try:
+                  # Some magazine CSS refers to remote scripts/images. Keep those
+                  # URLs in the article but do not treat them as local ZIP entries.
+                  original_get_files = splitter.get_split_files
+                  archive_names = set(splitter.epub.namelist())
+                  def content_files(nums):
+                      files = original_get_files(nums)
+                      missing = splitter.filecache.linkedfiles - archive_names
+                      for resource in missing:
+                          if not re.search(r"(?:^|/)(?:https?:/|data:|//)", resource):
+                              raise RuntimeError("Article refers to a missing local resource: " + resource)
+                      splitter.filecache.linkedfiles.intersection_update(archive_names)
+                      return files
+                  splitter.get_split_files = content_files
+                  lines = splitter.get_split_lines()
+                  last_label = title
+                  for line in lines:
+                      if line["toc"]:
+                          last_label = line["toc"][-1]
+                      elif "-continued" in line["href"]:
+                          line["toc"] = [last_label + " (continued)"]
+                  # Keep every original XHTML/article intact, including its anchor sections.
+                  grouped = OrderedDict()
+                  for line in lines:
+                      grouped.setdefault(line["href"], []).append(line["num"])
+                  chapters = list(grouped)
+                  weights = {}
+                  for href in chapters:
+                      splitter.get_split_files(grouped[href])
+                      resources = {href} | splitter.filecache.linkedfiles
+                      weights[href] = max(1, sum(splitter.epub.getinfo(resource).compress_size
+                                                for resource in resources))
+                      if weights[href] > MAX_BYTES - 100_000:
+                          expanded = source.with_name(source.stem + "-sections.epub")
+                          subdivide_article(source, expanded, href)
+                          splitter.epub.close()
+                          return split_epub(expanded, source_sha, title, depth + 1)
+                  if len(chapters) < 2:
+                      raise RuntimeError("This oversized EPUB cannot be split into smaller independent volumes")
+
+                  def midpoint(group):
+                      total = sum(weights[href] for href in group)
+                      left, options = 0, []
+                      for index, href in enumerate(group[:-1], 1):
+                          left += weights[href]
+                          options.append((abs(total - 2 * left), index))
+                      return min(options)[1]
+
+                  accepted = []
+                  def fit(group):
+                      candidate = source.with_name(f"split-check-{len(accepted):03d}.epub")
+                      nums = [num for href in group for num in grouped[href]]
+                      splitter.write_split_epub(str(candidate), nums, titleopt=title)
+                      if candidate.stat().st_size <= MAX_BYTES:
+                          accepted.append(group)
+                      elif len(group) > 1:
+                          cut = midpoint(group)
+                          fit(group[:cut])
+                          fit(group[cut:])
+                      else:
+                          raise RuntimeError("A single article and its original images exceed the email limit; "
+                                             "no lossy compression applied and no email sent")
+
+                  cut = midpoint(chapters)
+                  fit(chapters[:cut])
+                  fit(chapters[cut:])
+                  if [href for group in accepted for href in group] != chapters:
+                      raise RuntimeError("Split plan lost or reordered chapters")
+                  volumes = []
+                  for index, group in enumerate(accepted, 1):
+                      total = len(accepted)
+                      target = source.with_name(source.stem + f"-part-{index:02d}-of-{total:02d}.epub")
+                      signature = hashlib.sha256("\n".join(group).encode()).hexdigest()
+                      key = f"{source_sha}/split-v1/{signature}"
+                      label = f"{title} (Part {index}/{total})"
+                      splitter.write_split_epub(str(target),
+                          [num for href in group for num in grouped[href]], titleopt=label)
+                      set_unique_id(target, "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, key)))
+                      validate_epub(target)
+                      if target.stat().st_size > MAX_BYTES:
+                          raise RuntimeError("Final volume exceeds the safe email limit")
+                      with zipfile.ZipFile(target) as part:
+                          # Refuse delivery if the splitter alters any article or binary asset.
+                          for href in group:
+                              if part.read(href) != splitter.epub.read(href):
+                                  raise RuntimeError("Splitter altered article content: " + href)
+                          for entry in part.infolist():
+                              if entry.filename in ("mimetype", "content.opf", "toc.ncx", "META-INF/container.xml"):
+                                  continue
+                              if part.read(entry) != splitter.epub.read(entry.filename):
+                                  raise RuntimeError("Splitter altered an original resource: " + entry.filename)
+                      summary(f"Part {index}/{total}: {target.stat().st_size / 1048576:.2f} MiB; "
+                              f"{len(group)} original chapter files. Text/images unchanged.")
+                      volumes.append({"file": target.as_posix(), "key": key, "title": label})
+                  return volumes
+              finally:
+                  splitter.epub.close()
 
           def main():
               directory = os.environ["MAGAZINE_PATH"]
@@ -197,94 +416,137 @@ jobs:
               original.write_bytes(data)
               del data
               validate_epub(original)
-              attachment = original
               summary(f"Original size: {original.stat().st_size / 1048576:.2f} MiB")
               if original.stat().st_size > MAX_BYTES:
-                  for edge, quality, colors in [(1600, 80, 128), (1200, 65, 96), (900, 50, 64)]:
-                      candidate = original.with_name(original.stem + f"-optimized-{edge}.epub")
-                      optimize(original, candidate, edge, quality, colors)
-                      summary(f"Image optimization ({edge}px): {candidate.stat().st_size / 1048576:.2f} MiB")
-                      if candidate.stat().st_size < attachment.stat().st_size:
-                          attachment = candidate
-                      if attachment.stat().st_size <= MAX_BYTES:
-                          break
-              validate_epub(attachment)
-              if attachment.stat().st_size > MAX_BYTES:
-                  raise RuntimeError("EPUB still exceeds the safe email limit after image optimization; "
-                                     "no email sent and issue not marked as delivered")
-              if latest["sha"] not in state["sent"]:
-                  state["sent"].append(latest["sha"])
-              state.update({"latest_path": latest["path"], "latest_issue": issue,
-                            "sent_at": dt.datetime.now(dt.timezone.utc).isoformat()})
-              Path("delivery/next-state.json").write_text(json.dumps(state, indent=2) + "\n")
+                  volumes = split_epub(original, latest["sha"], f"{name} {issue}")
+              else:
+                  volumes = [{"file": original.as_posix(), "key": latest["sha"] + "/original",
+                              "title": f"{name} {issue}"}]
+              plan = {"source_sha": latest["sha"], "source_path": latest["path"],
+                      "issue": issue, "volumes": volumes}
+              Path("delivery/plan.json").write_text(json.dumps(plan, indent=2) + "\n")
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-                  f.write(f"file={attachment.as_posix()}\nissue={issue}\nready=true\n")
+                  f.write(f"issue={issue}\nready=true\n")
               if os.environ["DRY_RUN"] == "true":
                   summary("Dry run passed. No email sent and no delivery record saved.")
               else:
-                  summary("EPUB passed validation and size checks; ready to email.")
+                  summary(f"{len(volumes)} EPUB volume(s) passed validation; each will be emailed separately.")
 
           main()
 
-      - name: Send to Kindle
-        if: steps.latest.outputs.ready == 'true' && env.DRY_RUN != 'true'
-        uses: dawidd6/action-send-mail@6d98ae34d733f9a723a9e04e94f2f24ba05e1402 # v6
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: ${{ secrets.SMTP_USERNAME }}
-          to: ${{ secrets.KINDLE_EMAIL }}
-          subject: "[Kindle] ${{ matrix.magazine.name }} ${{ steps.latest.outputs.issue }}"
-          body: "Latest EPUB: ${{ matrix.magazine.name }} ${{ steps.latest.outputs.issue }}"
-          attachments: ${{ steps.latest.outputs.file }}
-
-      - name: Save successful delivery record
+      - name: Send each volume and save delivery progress
         if: steps.latest.outputs.ready == 'true' && env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          KINDLE_EMAIL: ${{ secrets.KINDLE_EMAIL }}
         shell: python
         run: |
           import base64
           import json
           import os
+          import smtplib
+          import ssl
           import time
           import urllib.error
           import urllib.parse
           import urllib.request
           from pathlib import Path
+          from email.message import EmailMessage
+          from email.policy import SMTP
+          from email.utils import getaddresses, formatdate, make_msgid
+          from datetime import datetime, timezone
 
           repo = os.environ["GITHUB_REPOSITORY"]
           path = ".delivery-state/" + os.environ["MAGAZINE_PATH"] + ".json"
           url = f"https://api.github.com/repos/{repo}/contents/{path}"
           headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
                      "Accept": "application/vnd.github+json",
-                     "User-Agent": "magazine-kindle-delivery"}
-          payload = {"message": "Record magazine delivery [skip ci]",
-                     "branch": os.environ["STATE_BRANCH"],
-                     "content": base64.b64encode(Path("delivery/next-state.json").read_bytes()).decode()}
-          for attempt in range(4):
+                     "User-Agent": "magazine-kindle-delivery",
+                     "Content-Type": "application/json"}
+
+          def read_state():
+              ref = urllib.parse.quote(os.environ["STATE_BRANCH"], safe="")
+              request = urllib.request.Request(url + "?ref=" + ref, headers=headers)
               try:
-                  ref = urllib.parse.quote(os.environ["STATE_BRANCH"], safe="")
-                  try:
-                      request = urllib.request.Request(url + "?ref=" + ref, headers=headers)
-                      with urllib.request.urlopen(request, timeout=60) as response:
-                          payload["sha"] = json.load(response)["sha"]
-                  except urllib.error.HTTPError as error:
-                      if error.code != 404:
-                          raise
-                      payload.pop("sha", None)
-                  request = urllib.request.Request(url, headers=headers, method="PUT",
-                                                   data=json.dumps(payload).encode())
                   with urllib.request.urlopen(request, timeout=60) as response:
-                      json.load(response)
-                  break
+                      record = json.load(response)
+                  return json.loads(base64.b64decode(record["content"])), record["sha"]
               except urllib.error.HTTPError as error:
-                  if error.code not in (409, 429, 500, 502, 503, 504) or attempt == 3:
-                      raise RuntimeError("Email was sent, but saving its delivery record failed; "
-                                         "check the recipient before retrying") from error
-                  time.sleep(2 ** attempt)
+                  if error.code != 404:
+                      raise
+                  return {"sent": [], "parts": []}, None
+
+          plan = json.loads(Path("delivery/plan.json").read_text())
+          def save_progress(part_key=None, complete=False):
+              for attempt in range(4):
+                  try:
+                      state, sha = read_state()
+                      if part_key and part_key not in state.setdefault("parts", []):
+                          state["parts"].append(part_key)
+                      if complete and plan["source_sha"] not in state.setdefault("sent", []):
+                          state["sent"].append(plan["source_sha"])
+                      state.update({"latest_path": plan["source_path"], "latest_issue": plan["issue"],
+                                    "sent_at": datetime.now(timezone.utc).isoformat()})
+                      payload = {"message": "Record magazine delivery [skip ci]",
+                                 "branch": os.environ["STATE_BRANCH"],
+                                 "content": base64.b64encode(json.dumps(state, indent=2).encode()).decode()}
+                      if sha:
+                          payload["sha"] = sha
+                      request = urllib.request.Request(url, headers=headers, method="PUT",
+                                                       data=json.dumps(payload).encode())
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          json.load(response)
+                      return
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (409, 429, 500, 502, 503, 504) or attempt == 3:
+                          raise RuntimeError("Email may already be sent, but saving progress failed; "
+                                             "check recipient before retrying") from error
+                      time.sleep(2 ** attempt)
+
+          for name in ("SMTP_USERNAME", "SMTP_PASSWORD", "KINDLE_EMAIL"):
+              if not os.environ.get(name, "").strip():
+                  raise RuntimeError("Missing repository secret: " + name)
+          recipients = [address for _, address in getaddresses(
+              [os.environ["KINDLE_EMAIL"].replace(";", ",")]) if address]
+          if not recipients:
+              raise RuntimeError("KINDLE_EMAIL contains no valid recipient")
+          state, _ = read_state()
+          force = os.environ["FORCE_SEND"] == "true"
+          # Prepare and size-check ALL messages before sending the first volume.
+          messages = []
+          for volume in plan["volumes"]:
+              if volume["key"] in state.get("parts", []) and not force:
+                  print("Already emailed volume; skipping: " + Path(volume["file"]).name)
+                  continue
+              attachment = Path(volume["file"])
+              message = EmailMessage(policy=SMTP)
+              message["From"] = os.environ["SMTP_USERNAME"].strip()
+              message["To"] = ", ".join(recipients)
+              message["Subject"] = "[Kindle] " + volume["title"]
+              message["Date"] = formatdate(localtime=False)
+              message["Message-ID"] = make_msgid()
+              message.set_content(volume["title"] + "\nOriginal text and image quality preserved.")
+              message.add_attachment(attachment.read_bytes(), maintype="application",
+                                     subtype="epub+zip", filename=attachment.name)
+              wire = message.as_bytes()
+              if len(wire) >= 25_000_000:
+                  raise RuntimeError("Encoded email exceeds the safe Gmail limit; no email sent")
+              messages.append((volume, wire))
+          for volume, wire in messages:
+              with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=120,
+                                    context=ssl.create_default_context()) as smtp:
+                  smtp.login(os.environ["SMTP_USERNAME"].strip(), os.environ["SMTP_PASSWORD"].strip())
+                  refused = smtp.sendmail(os.environ["SMTP_USERNAME"].strip(), recipients, wire)
+                  if refused:
+                      raise RuntimeError("Some recipients refused the volume; check recipient before retrying")
+                  # Save immediately after SMTP acceptance, before disconnecting.
+                  save_progress(volume["key"])
+              text = "SMTP accepted: " + Path(volume["file"]).name
+              print(text, flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                  f.write(text + "\n\n")
+          save_progress(complete=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("Email accepted by SMTP; delivery record saved. Kindle receipt still needs confirmation.\n")
+              f.write("All volumes accepted by SMTP; progress saved. Kindle receipt still needs confirmation.\n")
