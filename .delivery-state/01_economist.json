@@ -1,7 +1,8 @@
 {
   "sent": [
     "ff4a1b38e92e1559606c5406329301850f8a9ecd",
-    "cee27840c7d3734bbd285b898af60c8df980fb7b"
+    "cee27840c7d3734bbd285b898af60c8df980fb7b",
+    "78fdb7af78fe29164b8c4053a4bb48bf3ff17fb1"
   ],
   "parts": [
     "ff4a1b38e92e1559606c5406329301850f8a9ecd/original",
@@ -10,5 +11,5 @@
   ],
   "latest_path": "01_economist/te_2026.11.07/TheEconomist.2026.11.07.epub",
   "latest_issue": "2026-11-07",
-  "sent_at": "2026-11-06T23:37:16.326125+00:00"
+  "sent_at": "2026-11-06T23:37:18.389083+00:00"
 }
